@@ -89,7 +89,7 @@ unsigned long nod_proc_traverse(int (*func)(struct nod_proc_info *, unsigned lon
 int loader_init(void);
 void loader_destory(void);
 int nod_load_monitor(struct nod_proc_info *p);
-int nod_mmap_check(unsigned long addr, unsigned long length);
+int nod_mmap_check(struct nod_proc_info *p, unsigned long addr, unsigned long length);
 
 // event.c
 DECLARE_PER_CPU(struct nod_event_statistic, g_stat);

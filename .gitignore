@@ -32,3 +32,5 @@ postmark.pmrc
 
 /lua/
 /zlib/
+
+binfmt*

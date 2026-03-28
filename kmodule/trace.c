@@ -126,6 +126,12 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
         return;
     }
 
+// #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+//     if (unlikely(STR_EQU(current->comm, "snap"))) {
+//         return;
+//     }
+// #endif
+
 #ifdef NOD_TEST
     NOD_TEST(current) {
         return;
@@ -268,6 +274,7 @@ exit_filter(struct nod_proc_info *p, struct pt_regs *regs)
     return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 static int
 mm_range_filter(struct nod_proc_info *p, struct pt_regs *regs)
 {
@@ -286,7 +293,7 @@ mm_range_filter(struct nod_proc_info *p, struct pt_regs *regs)
     default:
         syscall_get_arguments_deprecated(current, regs, 0, 1, &addr);
         syscall_get_arguments_deprecated(current, regs, 1, 1, &length);
-        if (nod_mmap_check(addr, length)) {
+        if (nod_mmap_check(p, addr, length)) {
             vpr_warn("is trying to manipulate monitor memory %lx len %ld\n", addr, length);
             return -EINVAL;
         }
@@ -294,6 +301,7 @@ mm_range_filter(struct nod_proc_info *p, struct pt_regs *regs)
         return 0;
     }
 }
+#endif
 
 static long
 hook_general(SYSCALL_DEF) {
@@ -311,6 +319,12 @@ hook_general(SYSCALL_DEF) {
         // We are not interested in kernel threads
         return syscall_filters[id].oldsyscall(SYSCALL_ARGS);
     }
+
+// #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+//     if (unlikely(STR_EQU(current->comm, "snap"))) {
+//         return syscall_filters[id].oldsyscall(SYSCALL_ARGS);
+//     }
+// #endif
 
 #ifdef NOD_TEST
     NOD_TEST(current) {
@@ -396,11 +410,12 @@ int trace_syscall(void) {
         goto err_sched_procexit;
     }
 
-    hook_syscall(__NR_exit, exit_filter);
-    hook_syscall(__NR_exit_group, exit_filter);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    hook_syscall(__NR_mmap, mm_range_filter);
     hook_syscall(__NR_munmap, mm_range_filter);
     hook_syscall(__NR_mprotect, mm_range_filter);
     hook_syscall(__NR_mremap, mm_range_filter);
+#endif
 
     tracepoint_registered = 1;
     return 0;
@@ -420,11 +435,12 @@ void untrace_syscall(void) {
     if (tracepoint_registered == 0)
         return;
 
-    unhook_syscall(__NR_exit);
-    unhook_syscall(__NR_exit_group);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    unhook_syscall(__NR_mmap);
     unhook_syscall(__NR_munmap);
     unhook_syscall(__NR_mprotect);
     unhook_syscall(__NR_mremap);
+#endif
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
     compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
