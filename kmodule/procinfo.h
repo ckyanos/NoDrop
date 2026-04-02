@@ -40,6 +40,8 @@ struct nod_proc_security {
 
 struct nod_proc_info {
 	struct hlist_node rcu;
+	struct list_head daemon_node;
+	struct rcu_head rcu_head;
 	pid_t pid;
 	struct mm_struct *mm;
 	struct nod_buffer buffer;

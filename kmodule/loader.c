@@ -23,6 +23,7 @@ static struct elfhdr   monitor_elf_ex, interp_elf_ex;
 static struct file *filp_monitor, *filp_interpreter;
 
 static unsigned long monitor_info_off;
+static uint64_t monitor_phdr_vaddr;
 
 #define MAPPING_OK          0 
 #define MAPPING_NEXT        1
@@ -83,9 +84,31 @@ nod_mmap_check(unsigned long addr, unsigned long length)
     return check_mapping(get_monitor_addr, (void *)arg) == MAPPING_OK ? 1 : 0;
 }
 
+static int resolve_phdr_vaddr(const struct elfhdr *elf_ex,
+                              const struct elf_phdr *elf_phdrs,
+                              uint64_t *phdr_vaddr)
+{
+    int i;
+    const struct elf_phdr *phdr = elf_phdrs;
+
+    for (i = 0; i < elf_ex->e_phnum; i++, phdr++) {
+        if (phdr->p_type != PT_LOAD)
+            continue;
+
+        if (phdr->p_offset <= elf_ex->e_phoff &&
+            elf_ex->e_phoff < phdr->p_offset + phdr->p_filesz) {
+            *phdr_vaddr = elf_ex->e_phoff - phdr->p_offset + phdr->p_vaddr;
+            return 0;
+        }
+    }
+
+    return -ENOEXEC;
+}
+
 static int
 create_elf_tbls(struct elfhdr *exec,
                 uint64_t load_addr,
+                uint64_t exec_phdr_addr,
                 uint64_t interp_load_addr,
                 const struct pt_regs *regs,
                 const struct nod_stack_info *stack,
@@ -101,6 +124,7 @@ create_elf_tbls(struct elfhdr *exec,
     int items;
     uint64_t p;
     uint64_t arg_start, env_start, original_rsp;
+    uint64_t execfn = 0;
 
     elf_addr_t __user *sp;
     elf_addr_t __user *u_rand_bytes;
@@ -131,15 +155,18 @@ create_elf_tbls(struct elfhdr *exec,
 
     // put nod_stack_info into Runtime stack
     p = STACK_ALLOC(p, sizeof(*stack));
-    copy_to_user((char __user *)p, stack, sizeof(*stack));
+    if (copy_to_user((char __user *)p, stack, sizeof(*stack)))
+        goto err;
     argv[argc] = (char *)p;
 
     for(i = argc - 1; i >= 0; --i) {
         int len = strlen(argv[i]) + 1;
         p = STACK_ALLOC(p, len);
-        copy_to_user((char __user *)p, argv[i], len);
+        if (copy_to_user((char __user *)p, argv[i], len))
+            goto err;
     }
     arg_start = p;
+    execfn = arg_start;
 
 
 
@@ -162,13 +189,13 @@ create_elf_tbls(struct elfhdr *exec,
         INSERT_AUX_ENT(AT_HWCAP, ELF_HWCAP);
         INSERT_AUX_ENT(AT_PAGESZ, ELF_EXEC_PAGESIZE);
         INSERT_AUX_ENT(AT_CLKTCK, CLOCKS_PER_SEC);
-        INSERT_AUX_ENT(AT_PHDR, load_addr + exec->e_phoff);
+        INSERT_AUX_ENT(AT_PHDR, exec_phdr_addr);
         INSERT_AUX_ENT(AT_PHENT, sizeof(struct elf_phdr));
         INSERT_AUX_ENT(AT_PHNUM, exec->e_phnum);
         INSERT_AUX_ENT(AT_BASE, interp_load_addr);
         INSERT_AUX_ENT(AT_FLAGS, 0);
         INSERT_AUX_ENT(AT_ENTRY, load_addr + exec->e_entry);
-        INSERT_AUX_ENT(AT_EXECFN, original_rsp);
+        INSERT_AUX_ENT(AT_EXECFN, execfn);
         INSERT_AUX_ENT(AT_RANDOM, (elf_addr_t)(unsigned long)u_rand_bytes);
         INSERT_AUX_ENT(AT_NULL, 0);
     }
@@ -268,12 +295,14 @@ err:
 }
 
 static int
-do_load_monitor(const struct pt_regs *regs, uint64_t *entry, uint64_t *load, uint64_t *interp_load)
+do_load_monitor(const struct pt_regs *regs, uint64_t *entry, uint64_t *load,
+                uint64_t *phdr_addr, uint64_t *interp_load)
 {
     int retval;
     uint64_t load_addr = 0;
     uint64_t interp_load_addr = 0;
     uint64_t interp_map_addr = 0;
+    uint64_t monitor_phdr_addr = 0;
     uint64_t load_entry;
     uint64_t monitor_map_addr;
 
@@ -300,6 +329,7 @@ do_load_monitor(const struct pt_regs *regs, uint64_t *entry, uint64_t *load, uin
     load_entry = filp_interpreter ? 
                 interp_load_addr + interp_elf_ex.e_entry : 
                 load_addr + monitor_elf_ex.e_entry;
+    monitor_phdr_addr = load_addr + monitor_phdr_vaddr;
 
     vpr_dbg("load monitor at %llx\n"
             "load interp at %llx\n"
@@ -307,6 +337,7 @@ do_load_monitor(const struct pt_regs *regs, uint64_t *entry, uint64_t *load, uin
 
     if (entry)  *entry = load_entry;
     if (load)   *load = load_addr;
+    if (phdr_addr) *phdr_addr = monitor_phdr_addr;
     if (interp_load) *interp_load = interp_load_addr;
 
     retval = NOD_SUCCESS;
@@ -322,7 +353,7 @@ nod_load_monitor(struct nod_proc_info *p)
     uint64_t entry, sp;
     struct pt_regs *regs;
     struct elf64_hdr *cur_elf_ex;
-    uint64_t load_addr = 0, interp_load_addr = 0;
+    uint64_t load_addr = 0, phdr_addr = 0, interp_load_addr = 0;
     // nanoseconds start1, end1;
     // nanoseconds start2, end2;
 
@@ -343,7 +374,7 @@ nod_load_monitor(struct nod_proc_info *p)
 
     if (!p->load_addr) {
         // start1 = nod_nsecs();
-        retval = do_load_monitor(regs, &entry, &load_addr, &interp_load_addr);
+        retval = do_load_monitor(regs, &entry, &load_addr, &phdr_addr, &interp_load_addr);
         // end1 = nod_nsecs();
         if (retval != NOD_SUCCESS) {
             goto out;
@@ -359,7 +390,8 @@ nod_load_monitor(struct nod_proc_info *p)
     syscall_get_arguments_deprecated(current, regs, 0, 1, &p->stack.code);
 
     // if (cur_elf_ex) start2 = nod_nsecs();
-    retval = create_elf_tbls(cur_elf_ex, load_addr, interp_load_addr, regs, &p->stack, &sp, argv);
+    retval = create_elf_tbls(cur_elf_ex, load_addr, phdr_addr, interp_load_addr,
+                             regs, &p->stack, &sp, argv);
     // if (cur_elf_ex) {
     //   end2 = nod_nsecs();
     //   pr_info("%llu\n", (end1 - start1) + (end2 - start2));
@@ -405,6 +437,7 @@ int loader_init(void)
     interp_elf_phdata = NULL;
 
     monitor_info_off = 0;
+    monitor_phdr_vaddr = 0;
 
     filp_monitor = open_exec(MONITOR_PATH);
     retval = PTR_ERR(filp_monitor);
@@ -433,6 +466,9 @@ int loader_init(void)
         goto out_free_monitor;
     /* Load Program Header Table */
     if (elf_load_phdrs(&monitor_elf_ex, filp_monitor, &monitor_elf_phdata))
+        goto out_free_monitor;
+    retval = resolve_phdr_vaddr(&monitor_elf_ex, monitor_elf_phdata, &monitor_phdr_vaddr);
+    if (retval)
         goto out_free_monitor;
     /* Load Section Header Table */
     if (elf_load_shdrs(&monitor_elf_ex, filp_monitor, &monitor_elf_shdata))
@@ -506,7 +542,7 @@ int loader_init(void)
     }
 
     if (!elf_interpreter) {
-        pr_warn("No dynamic linker, consider static linked\n");
+        vpr_dbg("monitor has no PT_INTERP segment, treat as static-linked\n");
         goto success;
     }
 

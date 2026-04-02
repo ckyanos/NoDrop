@@ -44,21 +44,22 @@ padzero(unsigned long elf_bss) {
 }
 
 static unsigned long
-total_mapping_size(struct elf_phdr *cmds, int nr) {
-    int i, first_idx = -1, last_idx = -1;
+total_mapping_size(const struct elf_phdr *phdr, int nr)
+{
+    elf_addr_t min_addr = -1;
+    elf_addr_t max_addr = 0;
+    bool pt_load = false;
+    int i;
 
     for (i = 0; i < nr; i++) {
-        if (cmds[i].p_type == PT_LOAD) {
-            last_idx = i;
-            if (first_idx == -1)
-                first_idx = i;
+        if (phdr[i].p_type == PT_LOAD) {
+            min_addr = MIN(min_addr, ELF_PAGESTART(phdr[i].p_vaddr));
+            max_addr = MAX(max_addr, phdr[i].p_vaddr + phdr[i].p_memsz);
+            pt_load = true;
         }
     }
-    if (first_idx == -1)
-        return 0;
 
-    return cmds[last_idx].p_vaddr + cmds[last_idx].p_memsz -
-                ELF_PAGESTART(cmds[first_idx].p_vaddr);
+    return pt_load ? (max_addr - min_addr) : 0;
 }
 
 static unsigned long
@@ -94,6 +95,54 @@ elf_map(struct file *filep, unsigned long addr,
     }
 
     return(map_addr);
+}
+
+/*
+ * Load one PT_LOAD segment and materialize trailing zero pages/bss in the
+ * same way as Linux 6.8 binfmt_elf does.
+ */
+static unsigned long
+elf_load(struct file *filep, unsigned long addr,
+         struct elf_phdr *eppnt, int prot, int type,
+         unsigned long total_size)
+{
+    unsigned long zero_start, zero_end;
+    unsigned long map_addr;
+
+    if (eppnt->p_filesz) {
+        map_addr = elf_map(filep, addr, eppnt, prot, type, total_size);
+        if (BAD_ADDR(map_addr))
+            return map_addr;
+
+        if (eppnt->p_memsz > eppnt->p_filesz) {
+            zero_start = map_addr + ELF_PAGEOFFSET(eppnt->p_vaddr) + eppnt->p_filesz;
+            zero_end = map_addr + ELF_PAGEOFFSET(eppnt->p_vaddr) + eppnt->p_memsz;
+
+            /*
+             * Zero the end of the last file-backed page. Keep compatibility
+             * with non-writable segments where this may legitimately fail.
+             */
+            if (padzero(zero_start) && (prot & PROT_WRITE))
+                return -EFAULT;
+        }
+    } else {
+        map_addr = zero_start = ELF_PAGESTART(addr);
+        zero_end = zero_start + ELF_PAGEOFFSET(eppnt->p_vaddr) + eppnt->p_memsz;
+    }
+
+    if (eppnt->p_memsz > eppnt->p_filesz) {
+        int err;
+
+        zero_start = ELF_PAGEALIGN(zero_start);
+        zero_end = ELF_PAGEALIGN(zero_end);
+
+        err = vm_brk_flags(zero_start, zero_end - zero_start,
+                           prot & PROT_EXEC ? VM_EXEC : 0);
+        if (err)
+            map_addr = err;
+    }
+
+    return map_addr;
 }
 
 int
@@ -234,31 +283,23 @@ elf_load_binary(struct elfhdr *elf_ex,
         struct file *binary, uint64_t *map_addr,
         unsigned long no_base, struct elf_phdr *elf_phdrs) {
     int i;
-    int load_addr_set = 0;
-    int bss_prot = 0;
+    int first_pt_load = 1;
     struct elf_phdr *eppnt;
     uint64_t load_addr = 0;
-    uint64_t last_bss = 0, elf_bss = 0;
     unsigned long error = ~0UL;
-    unsigned long total_size;
+    unsigned long total_size = 0;
 
     /* First of all, some simple consistency checks */
     if (elf_ex->e_type != ET_EXEC &&
         elf_ex->e_type != ET_DYN)
         goto out;
 
-    total_size = total_mapping_size(elf_phdrs, elf_ex->e_phnum);
-    if (!total_size) {
-        error = -EINVAL;
-        goto out;
-    }
-
     eppnt = elf_phdrs;
     for (i = 0; i < elf_ex->e_phnum; i++, eppnt++) {
         if (eppnt->p_type == PT_LOAD) {
-            int elf_type = MAP_PRIVATE /*| MAP_DENYWRITE*/;
+            int elf_type = MAP_PRIVATE;
             int elf_prot = 0;
-            unsigned long vaddr = 0;
+            unsigned long vaddr = eppnt->p_vaddr;
             unsigned long k, _addr;
 
             if (eppnt->p_flags & PF_R)
@@ -267,26 +308,44 @@ elf_load_binary(struct elfhdr *elf_ex,
                 elf_prot |= PROT_WRITE;
             if (eppnt->p_flags & PF_X)
                 elf_prot |= PROT_EXEC;
-            vaddr = eppnt->p_vaddr;
-            if (load_addr_set)
+
+            if (!first_pt_load) {
                 elf_type |= MAP_FIXED;
-            else if (elf_ex->e_type == ET_DYN || elf_ex->e_type == ET_EXEC)
-                load_addr = -vaddr;
-            
-            _addr = elf_map(binary, load_addr + vaddr,
-                    eppnt, elf_prot, elf_type, total_size);
-            total_size = 0;
+            } else if (elf_ex->e_type == ET_EXEC) {
+                elf_type |= MAP_FIXED_NOREPLACE;
+            } else {
+                total_size = total_mapping_size(elf_phdrs, elf_ex->e_phnum);
+                if (!total_size) {
+                    error = -EINVAL;
+                    goto out;
+                }
+
+                if (no_base) {
+                    load_addr = no_base;
+                    elf_type |= MAP_FIXED_NOREPLACE;
+                } else {
+                    load_addr = 0;
+                }
+
+                load_addr = ELF_PAGESTART(load_addr - vaddr);
+            }
+
+            _addr = elf_load(binary, load_addr + vaddr,
+                             eppnt, elf_prot, elf_type,
+                             first_pt_load ? total_size : 0);
             if (!*map_addr)
                 *map_addr = _addr;
             error = _addr;
             if (BAD_ADDR(_addr)) {
-                vpr_dbg("map segment at %llx failed (%d)\n", load_addr + vaddr, _addr);
+                vpr_dbg("map segment at %llx failed (%ld)\n", load_addr + vaddr, _addr);
                 goto out;
             }
 
-            if (!load_addr_set) {
-                load_addr = _addr - ELF_PAGESTART(vaddr);
-                load_addr_set = 1;
+            if (first_pt_load) {
+                first_pt_load = 0;
+                if (elf_ex->e_type == ET_DYN) {
+                    load_addr += _addr - ELF_PAGESTART(load_addr + vaddr);
+                }
             }
 
             /*
@@ -294,56 +353,15 @@ elf_load_binary(struct elfhdr *elf_ex,
              * allowed task size. Note that p_filesz must always be
              * <= p_memsize so it's only necessary to check p_memsz.
              */
-            k = load_addr + eppnt->p_vaddr;
+            k = eppnt->p_vaddr;
             if (BAD_ADDR(k) ||
                 eppnt->p_filesz > eppnt->p_memsz ||
                 eppnt->p_memsz > TASK_SIZE ||
                 TASK_SIZE - eppnt->p_memsz < k) {
-                error = -ENOMEM;
+                error = -EINVAL;
                 goto out;
             }
-
-            /*
-             * Find the end of the file mapping for this phdr, and
-             * keep track of the largest address we see for this.
-             */
-            k = load_addr + eppnt->p_vaddr + eppnt->p_filesz;
-            if (k > elf_bss)
-                elf_bss = k;
-
-            /*
-             * Do the same thing for the memory mapping - between
-             * elf_bss and last_bss is the bss section.
-             */
-            k = load_addr + eppnt->p_vaddr + eppnt->p_memsz;
-            if (k > last_bss) {
-                last_bss = k;
-                bss_prot = elf_prot;
-            }
         }
-    }
-    /*
-     * Now fill out the bss section: first pad the last page from
-     * the file up to the page boundary, and zero it from elf_bss
-     * up to the end of the page.
-     */
-    if (padzero(elf_bss)) {
-        error = -EFAULT;
-        goto out;
-    }
-    /*
-     * Next, align both the file and mem bss up to the page size,
-     * since this is where elf_bss was just zeroed up to, and where
-     * last_bss will end after the vm_brk_flags() below.
-     */
-    elf_bss = ELF_PAGEALIGN(elf_bss);
-    last_bss = ELF_PAGEALIGN(last_bss);
-    /* Finally, if there is still more bss to allocate, do it. */
-    if (last_bss > elf_bss) {
-        error = vm_brk_flags(elf_bss, last_bss - elf_bss,
-                bss_prot & PROT_EXEC ? VM_EXEC : 0);
-        if (error)
-            goto out;
     }
 
     error = load_addr;

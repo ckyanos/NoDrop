@@ -19,6 +19,11 @@ static int nodrop_init(void)
         goto out_procinfo;
     }
 
+    if ((err = nod_daemon_init())) {
+        pr_err("daemon initialization failed (%d)\n", err);
+        goto out_daemon;
+    }
+
     if((err = tracepoint_init())) {
         pr_err("hook syscall_table failed (%d)\n", err);
         goto out_trace;
@@ -39,6 +44,8 @@ out_trace:
     tracepoint_destory();
 out_procinfo:
     procinfo_destroy();
+out_daemon:
+    nod_daemon_destroy();
 out_loader:
     loader_destory();
     goto out;

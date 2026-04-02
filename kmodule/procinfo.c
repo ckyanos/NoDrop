@@ -17,6 +17,14 @@ static struct kmem_cache *proc_info_cachep = NULL;
 
 static DEFINE_READ_MOSTLY_HASHTABLE(proc_info_hl_head, 10);
 
+void nod_free_procinfo(struct nod_proc_info *p);
+
+static void __nod_free_procinfo_rcu(struct rcu_head *rcu)
+{
+    struct nod_proc_info *p = container_of(rcu, struct nod_proc_info, rcu_head);
+    nod_free_procinfo(p);
+}
+
 static inline struct nod_proc_info *
 __find_proc_info(struct task_struct *task)
 {
@@ -45,7 +53,6 @@ static void
 __remove_proc_info(struct nod_proc_info *p)
 {
     hash_del_rcu(&p->rcu);
-    synchronize_rcu();
 }
 
 void
@@ -78,7 +85,7 @@ nod_alloc_procinfo(void)
     }
 
     memset(p, 0, sizeof(struct nod_proc_info));
-
+    INIT_LIST_HEAD(&p->daemon_node);
     if(init_buffer(&p->buffer)) {
         vpr_err("allocate kernel buffer for nod_proc_info failed\n");
         goto out_free_cache;
@@ -136,19 +143,27 @@ out:
 enum nod_proc_status
 nod_proc_release(struct task_struct *task)
 {
-    int retval;
+    int retval, ret;
     struct nod_proc_info *p;
 
     p = __find_proc_info(task);
     if (!p) {
         return NOD_UNKNOWN;
     }
-
     retval = p->status;
     per_cpu(g_stat, smp_processor_id()).n_drop_evts_unsolved += p->buffer.info->nevents;
 
     __remove_proc_info(p);
-    nod_free_procinfo(p);
+
+    if (p->buffer.info->tail > 0) {
+        ret = nod_daemon_submit_proc(p);
+        if (!ret) {
+            return retval;
+        }
+        vpr_warn("daemon queue failed (%d), drop residual logs for pid %d\n", ret, p->pid);
+    }
+
+    call_rcu(&p->rcu_head, __nod_free_procinfo_rcu);
 
     return retval;
 }
@@ -257,15 +272,15 @@ procinfo_destroy(void)
     struct nod_proc_info *this;
     struct hlist_node *tmp;
     if(proc_info_cachep) {
-        rcu_read_lock();
         hash_for_each_safe(proc_info_hl_head, bkt, tmp, this, rcu) {
+            hash_del_rcu(&this->rcu);
             while(this->status == NOD_IN) {
                 pr_info("wait for exiting monitor (pid %d status %d)\n", this->pid, this->status);
                 msleep(5);
             }
             nod_free_procinfo(this);
         }
-        rcu_read_unlock();
+        synchronize_rcu();
         kmem_cache_destroy(proc_info_cachep);
     }
 }

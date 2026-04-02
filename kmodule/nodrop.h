@@ -16,9 +16,9 @@
 #define vpr_dbg(fmt, ...)
 // #define vpr_dbg(fmt, ...) vpr_log(info, fmt, ##__VA_ARGS__)
 
-// #define NOD_TEST(task) if (!(task->cred->uid.val == 1000))
-#define NOD_TEST(task) if (!(STR_EQU(current->comm, "stress")))
-#define NOD_TEST(task) if (!(STR_EQU(current->comm, "helloworld")))
+#define NOD_TEST(task) if (!(task->cred->uid.val == 1000))
+// #define NOD_TEST(task) if (!(STR_EQU(current->comm, "stress")))
+// #define NOD_TEST(task) if (!(STR_EQU(current->comm, "helloworld")))
 #define STR_EQU(s1, s2) (strcmp(s1, s2) == 0)
 #define ASSERT(expr) BUG_ON(!(expr))
 
@@ -55,6 +55,11 @@ void trace_register_destory(void);
 int  proc_init(void);
 void proc_destroy(void);
 
+
+int nod_daemon_init(void);
+void nod_daemon_destroy(void);
+int nod_daemon_submit_proc(struct nod_proc_info *p);
+
 // privil.c
 unsigned int nod_get_seccomp(void);
 void nod_prepare_context(struct nod_proc_info *p, struct pt_regs *regs);
@@ -81,7 +86,7 @@ int nod_share_procinfo(struct task_struct *task, struct nod_proc_info *p);
 int nod_event_from(struct nod_proc_info **p);
 int nod_proc_check_mm(struct nod_proc_info *p, unsigned long addr, unsigned long length);
 unsigned long nod_proc_traverse(int (*func)(struct nod_proc_info *, unsigned long *, va_list), ...);
-
+void nod_free_procinfo(struct nod_proc_info *p);
 // loader.c
 int loader_init(void);
 void loader_destory(void);
