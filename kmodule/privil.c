@@ -10,7 +10,6 @@
 #include <linux/types.h>
 #include <linux/path.h>
 #include <linux/fs_struct.h>
-#include <asm/fpu/internal.h>
 #include <linux/fdtable.h>
 #include "nodrop.h"
 #include "common.h"
@@ -192,8 +191,8 @@ nod_restore_security(struct nod_proc_info *p)
     if (p->ioctl_fd >= 0) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
         //ksys_close(p->ioctl_fd);
-        filp_close(fget(p->ioctl_fd), NULL);
-        //close_fd(p->ioctl_fd);
+        // filp_close(fget(p->ioctl_fd), NULL);
+        close_fd(p->ioctl_fd);
 #else
         sys_close(p->ioctl_fd);
 #endif

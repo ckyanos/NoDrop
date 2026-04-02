@@ -51,9 +51,9 @@ check_mapping(int (*resolve) (struct vm_area_struct const * const vma, void *arg
     struct vm_area_struct *vma;
 
     mm = current->mm;
-
     mmap_read_lock(mm);
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+    VMA_ITERATOR(vmi, mm, 0);
+    for_each_vma(vmi, vma) {
         if (vma->vm_file == filp_monitor) {
             retval = (*resolve)((struct vm_area_struct const * const)vma, arg);
             switch(retval) {
@@ -63,7 +63,7 @@ check_mapping(int (*resolve) (struct vm_area_struct const * const vma, void *arg
             case MAPPING_NEXT:
                 break;
             default:
-            mmap_read_unlock(mm);
+                    mmap_read_unlock(mm);
                 ASSERT(false);
             }
         }
@@ -118,7 +118,7 @@ create_elf_tbls(struct elfhdr *exec,
         /*
          * Put randomly-sized (8~15) bytes for stack randomization
          */
-        i = (get_random_int() % 8) + 8;
+        i = (get_random_long() % 8) + 8;
     }
 
     get_random_bytes(k_rand_bytes, i);
