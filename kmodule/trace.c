@@ -324,9 +324,32 @@ inline void nod_write_cr0(unsigned long cr0) {
 #define WPOFF do { nod_write_cr0(read_cr0() & (~0x10000)); } while (0);
 #define WPON  do { nod_write_cr0(read_cr0() | 0x10000);    } while (0);
 
+#if defined(CONFIG_X86_64) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0) && \
+    !defined(NOD_ENABLE_UNSAFE_SYSCALL_TABLE_HOOKS)
+#define NOD_DISABLE_SYSCALL_TABLE_HOOKS 1
+#endif
+
+static int syscall_table_hooks_available(void)
+{
+#ifdef NOD_DISABLE_SYSCALL_TABLE_HOOKS
+    /*
+     * Newer x86_64 kernels may fault when a module tries to clear CR0.WP and
+     * patch sys_call_table directly. Keep the module loadable by default and
+     * require an explicit opt-in for the legacy hook path.
+     */
+    // pr_warn_once("NoDrop: syscall_table patching is disabled on this kernel; exit/mm filters were not installed\n");
+    return 0;
+#else
+    return 1;
+#endif
+}
+
 static void
 hook_syscall(int id, int (*filter)(struct nod_proc_info *, struct pt_regs *))
 {
+    if (!syscall_table_hooks_available())
+        return;
+
     if (id < 0 || id >= SYSCALL_TABLE_SIZE)
         return;
 
@@ -382,11 +405,11 @@ int trace_syscall(void) {
         goto err_sched_procexit;
     }
 
-    // hook_syscall(__NR_exit, exit_filter);
-    // hook_syscall(__NR_exit_group, exit_filter);
-    // hook_syscall(__NR_munmap, mm_range_filter);
-    // hook_syscall(__NR_mprotect, mm_range_filter);
-    // hook_syscall(__NR_mremap, mm_range_filter);
+    hook_syscall(__NR_exit, exit_filter);
+    hook_syscall(__NR_exit_group, exit_filter);
+    hook_syscall(__NR_munmap, mm_range_filter);
+    hook_syscall(__NR_mprotect, mm_range_filter);
+    hook_syscall(__NR_mremap, mm_range_filter);
 
     tracepoint_registered = 1;
     return 0;
@@ -406,11 +429,11 @@ void untrace_syscall(void) {
     if (tracepoint_registered == 0)
         return;
 
-    // unhook_syscall(__NR_exit);
-    // unhook_syscall(__NR_exit_group);
-    // unhook_syscall(__NR_munmap);
-    // unhook_syscall(__NR_mprotect);
-    // unhook_syscall(__NR_mremap);
+    unhook_syscall(__NR_exit);
+    unhook_syscall(__NR_exit_group);
+    unhook_syscall(__NR_munmap);
+    unhook_syscall(__NR_mprotect);
+    unhook_syscall(__NR_mremap);
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
     compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
