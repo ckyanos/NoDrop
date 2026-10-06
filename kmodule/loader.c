@@ -10,6 +10,11 @@
 #include <linux/mman.h>
 #include <linux/vmalloc.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#include <linux/preempt.h>
+#include <linux/hardirq.h>
+#include <linux/irqflags.h>
+#endif
 
 #include "nodrop.h"
 #include "syscall.h"
@@ -583,6 +588,23 @@ nod_load_monitor(struct nod_proc_info *p)
     const char *argv[] = { CONFIG_MONITOR_PATH, NULL };
 
     regs = current_pt_regs();
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    /*
+     * 首次加载要走 load_monitor_image -> vm_mmap（会睡眠），而本函数可能在
+     * sys_exit 探针的原子上下文（preempt disabled + RCU 读侧）里被"缓冲区满"
+     * 触发。这里只登记"待加载"，映射 + 建帧 + 改 regs 留给这条线程回到可睡眠的
+     * 安全点（kmodule/trace.c 里 ftrace 重定向后的 x64_sys_call 返回路径）完成。
+     * 触发条件与零丢失语义不变；<6.0 没有这个标记，行为原样。
+     */
+    if (!p->entry_addr || !p->stack_addr) {
+        if (in_interrupt() || irqs_disabled() || in_atomic() || preempt_count()) {
+            p->need_load = 1;
+            return NOD_SUCCESS;
+        }
+    }
+    p->need_load = 0;
+#endif
 
     switch(p->status) {
     case NOD_CLONE:

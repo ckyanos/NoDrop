@@ -509,26 +509,70 @@ nod_skip_current_task(void)
     return false;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+/*
+ * 触发点在 sys_exit 探针（原子上下文）时，首次注入只置 p->need_load；
+ * 这里（ftrace 重定向后的 x64_sys_call 返回路径、普通进程上下文）把注入做完。
+ * nod_load_monitor() 内部用 current_pt_regs() 改 regs，因此进入 monitor 的
+ * 时机就是这次系统调用返回用户态之前，语义与"触发点同步加载"一致。
+ *
+ * retval 是本次系统调用将要返回给应用的值：本函数就是 x64_sys_call 的替身，
+ * do_syscall_x64 要等我们返回之后才执行 regs->ax = 返回值；而注入会把
+ * current_pt_regs() 整份存进 p->ctx，monitor 结束时模块再把它 memcpy 回 regs
+ * （monitor 走 ioctl RESTORE_CONTEXT）。所以注入之前必须先把真实返回值写进
+ * regs->ax，否则存下来的是 entry_SYSCALL_64 压入的 -ENOSYS 占位值，应用会在
+ * monitor 返回后拿到 -ENOSYS（动态链接器的 mprotect 于是报
+ * "cannot apply additional memory protection after relocation: Error 38"）。
+ */
+static void
+nod_run_deferred_load(long retval)
+{
+    struct nod_proc_info *p = NULL;
+
+    nod_event_from(&p);
+    if (p && p->need_load) {
+        struct pt_regs *regs = current_pt_regs();
+
+        if (regs)
+            regs->ax = retval;
+
+        p->need_load = 0;
+        nod_load_monitor(p);
+    }
+}
+#else
+static inline void nod_run_deferred_load(long retval) { (void)retval; }
+#endif
+
 static long notrace
 nod_x64_sys_call_hook(const struct pt_regs *regs, unsigned int nr)
 {
-    int ret;
+    long ret;
     struct nod_proc_info *p;
 
     if (unlikely(!nod_old_x64_sys_call))
         return -ENOSYS;
 
     if (unlikely(nr >= SYSCALL_TABLE_SIZE))
-        return nod_old_x64_sys_call(regs, nr);
-    if (unlikely(!syscall_filters[nr].hooked || !syscall_filters[nr].filter))
-        return nod_old_x64_sys_call(regs, nr);
+        ret = nod_old_x64_sys_call(regs, nr);
+    else if (unlikely(!syscall_filters[nr].hooked || !syscall_filters[nr].filter))
+        ret = nod_old_x64_sys_call(regs, nr);
+    else {
+        nod_event_from(&p);
+        ret = syscall_filters[nr].filter(p, (struct pt_regs *)regs);
+        if (!ret)
+            ret = nod_old_x64_sys_call(regs, nr);
+    }
 
-    nod_event_from(&p);
-    ret = syscall_filters[nr].filter(p, (struct pt_regs *)regs);
-    if (ret)
-        return ret;
+    /*
+     * 安全点：ftrace 把 x64_sys_call 的返回路径重定向到这里，此时真实系统调用
+     * 已经跑完、上下文可睡眠（不是探针/ftrace 回调里）。原子触发点（缓冲区满）
+     * 推迟下来的首次注入在这里完成：映射 + 建帧 + 改 regs 都在安全上下文里做。
+     * 触发条件、零丢失、每线程实例都不变；<6.0 没有这个标记，函数体为空。
+     */
+    nod_run_deferred_load(ret);
 
-    return nod_old_x64_sys_call(regs, nr);
+    return ret;
 }
 
 static void notrace
