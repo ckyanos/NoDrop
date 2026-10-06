@@ -144,6 +144,15 @@ int nod_monitor_main(char *buffer, struct nod_buffer_info *buffer_info, struct n
     while (ptr < buffer_end)
     {
         hdr = (struct nod_event_hdr *)ptr;
+
+        /*
+         * 消费前先校验长度：len < 头部长度会越界读，len == 0 会死循环，
+         * hdr + len 越过 buffer_end 会把游标推到别的内存上。任一情况都停下来。
+         */
+        if (hdr->len < sizeof(*hdr) ||
+            (char *)hdr + hdr->len > buffer_end)
+            break;
+
         buffer_info->n_solved_evts++;
         evt.raw = hdr;
         lua_on_event(&evt);

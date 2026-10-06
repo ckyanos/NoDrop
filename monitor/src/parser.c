@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,49 +98,144 @@ int evt_arg_to_string(const struct nod_param_info *param, const void *data, uint
     }
 }
 
+/*
+ * 剩余可写长度：off 一旦越过 mx_size，mx_size - off 就是负数，
+ * 传给 snprintf 会被转成巨大的 size_t 从而越界写（历史崩溃点），这里夹到 0。
+ */
+static int nod_left(int mx_size, int off)
+{
+    return off < mx_size ? mx_size - off : 0;
+}
+
+/*
+ * 带边界的追加：只在还有空间时格式化，并把 snprintf "本来要写"的返回值
+ * 钳进 [0, mx_size]，保证 out 始终以 '\0' 结尾且 off 不会失控。
+ */
+static void nod_append(char *out, int mx_size, int *off, const char *fmt, ...)
+{
+    va_list ap;
+    int left = nod_left(mx_size, *off);
+    int n;
+
+    if (left <= 0)
+        return;
+
+    va_start(ap, fmt);
+    n = vsnprintf(out + *off, (size_t)left, fmt, ap);
+    va_end(ap);
+
+    if (n > 0)
+        *off += n;
+    if (*off > mx_size)
+        *off = mx_size;
+}
+
+/* 定长参数在事件里至少占这么多字节；0 表示长度由长度表给出（字符串类） */
+static size_t nod_param_min_size(int type)
+{
+    switch (type)
+    {
+    case PT_FLAGS8:
+    case PT_UINT8:
+    case PT_SIGTYPE:
+    case PT_INT8:
+        return 1;
+    case PT_FLAGS16:
+    case PT_UINT16:
+    case PT_SYSCALLID:
+    case PT_INT16:
+        return 2;
+    case PT_FLAGS32:
+    case PT_UINT32:
+    case PT_MODE:
+    case PT_UID:
+    case PT_GID:
+    case PT_SIGSET:
+    case PT_INT32:
+        return 4;
+    case PT_RELTIME:
+    case PT_ABSTIME:
+    case PT_UINT64:
+    case PT_INT64:
+    case PT_ERRNO:
+    case PT_FD:
+    case PT_PID:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
 int get_whole_event(const struct nod_event_hdr *hdr, char *out, int mx_size) {
     int off = 0;
     const struct nod_event_info *info;
     const struct nod_param_info *param;
-    uint16_t *args;
-    char *data;
+    const uint16_t *args;
+    const char *data, *ev_end;
     char tmp[256];
+
+    if (mx_size <= 0)
+        return 0;
+    out[0] = '\0';
+
+    if (!hdr || hdr->type >= NODE_EVENT_MAX)
+        return 0;
+
     info = &g_event_info[hdr->type];
-    off += snprintf(out + off, mx_size - off,
-                "%lu %u (%u): %s(",
-                hdr->ts,
-                hdr->tid,
-                hdr->cpuid,
-                info->name);
-    args = (uint16_t *)(hdr + 1);
-    data = (char *)(args + info->nparams);
+
+    /* 长度表（每个参数一个 uint16_t 长度）必须落在事件声明长度之内 */
+    args = (const uint16_t *)(hdr + 1);
+    data = (const char *)(args + info->nparams);
+    ev_end = (const char *)hdr + hdr->len;
+    if (hdr->len < sizeof(*hdr) + info->nparams * sizeof(uint16_t) ||
+        data > ev_end)
+        return 0;
+
+    nod_append(out, mx_size, &off,
+               "%lu %u (%u): %s(",
+               hdr->ts,
+               hdr->tid,
+               hdr->cpuid,
+               info->name);
 
     for (size_t i = 0; i < info->nparams; ++i)
     {
+        size_t avail, need;
+        uint16_t alen;
+
+        if (nod_left(mx_size, off) <= 0)
+            break;
+
         param = &info->params[i];
+        avail = (size_t)(ev_end - data);
 
         if (i > 0)
-            off += snprintf(out + off, mx_size - off, ", ");
+            nod_append(out, mx_size, &off, ", ");
 
         /* param name */
-        off += snprintf(out + off, mx_size - off,
-                        "%s=", param->name);
+        nod_append(out, mx_size, &off, "%s=", param->name);
 
-        /* param value */
-        evt_arg_to_string(param, data, args[i],
-                          tmp, sizeof(tmp));
-
-        off += snprintf(out + off, mx_size - off,
-                        "%s", tmp);
-
-        data += args[i];
-
-        if (off >= (int)mx_size)
+        /*
+         * param value：只按事件声明长度内的字节读，长度表撒谎时打 <oob> 并停止，
+         * 不再像以前那样把 data / 长度推进到事件之外。
+         */
+        alen = args[i];
+        if ((size_t)alen > avail)
+            alen = (uint16_t)avail;
+        need = nod_param_min_size(param->type);
+        if (need > avail || (need == 0 && (size_t)args[i] > avail)) {
+            nod_append(out, mx_size, &off, "<oob>");
             break;
+        }
+
+        evt_arg_to_string(param, data, alen, tmp, sizeof(tmp));
+        nod_append(out, mx_size, &off, "%s", tmp);
+
+        data += alen;
     }
 
-    /* closing */
-    off += snprintf(out + off, mx_size - off, ")\n");
+    /* closing：同样在边界检查之内，写不下就只保留已写好的部分 */
+    nod_append(out, mx_size, &off, ")\n");
     return off;
 }
 
