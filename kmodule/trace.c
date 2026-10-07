@@ -48,7 +48,11 @@ static uint64_t nod_lookup_name(const char *name);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 #ifdef __NR_clone3
-static int nod_clone3_flags(struct pt_regs *regs, unsigned long *flags)
+/*
+ * 约束 2（NoTamper）后不再参与分类决定：子任务一律 NOD_SHARE，不再按 clone
+ * flags 区分。保留这个读取函数以便 #if 0 里的原分类代码仍然完整可还原。
+ */
+static int __maybe_unused nod_clone3_flags(struct pt_regs *regs, unsigned long *flags)
 {
     unsigned long uargs;
     struct clone_args args;
@@ -225,7 +229,31 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
     case NOD_CLONE:
     case NOD_SHARE:
         if (id == __NR_clone && ret == 0) {
-            // forked child process
+            // child task
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+            /*
+             * 约束 2（NoTamper「threads always share」）：clone/clone3 的子任务
+             * 一律按 NOD_SHARE 处理，不看 clone flags。共享路径只把 pkey 对齐到
+             * group leader，镜像 / 分离栈 / 帧都不继承 —— 每个子任务在自己的
+             * 首次激活时各自映射一份 monitor 镜像、各自分配分离栈、各自建帧。
+             *
+             * 原按 flags 分类的代码保留在 #if 0 里（NoTamper 的形态）：6.8 上这
+             * 段分类发生在 sys_exit 探针里，clone3 要现读父线程用户栈上的
+             * struct clone_args，父线程常常已经复用那块内存（200 次 pthread
+             * 创建里 5~9 次读到 flags=0），于是线程被判成 NOD_CLONE 并继承
+             * leader 的镜像与帧，两条线程在同一个实例上并发跑 monitor。
+             * <6.0 的 clone 分类读的是寄存器（准确），保持逐字节不变。
+             */
+#if 0
+            unsigned long clone_flags;
+            syscall_get_arguments_deprecated(current, regs, 1, 1, &clone_flags);
+            evt_from = (clone_flags & CLONE_VM) ? NOD_SHARE : NOD_CLONE;
+#else
+            evt_from = NOD_SHARE;
+#endif
+            if (!nod_proc_acquire(evt_from, NULL, -1, current))
+                vpr_err("acquire %d for childed process failed\n", evt_from);
+#else
             unsigned long clone_flags;
             syscall_get_arguments_deprecated(current, regs, 1, 1, &clone_flags);
             if (clone_flags & CLONE_VM) {
@@ -240,9 +268,12 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
                 if (!nod_proc_acquire(NOD_CLONE, NULL, -1, current))
                     vpr_err("acquire NOD_CLONE for childed process failed\n");
             }
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 #ifdef __NR_clone3
         } else if (id == __NR_clone3 && ret == 0) {
+            // child task (same rule as clone, see above)
+#if 0
             unsigned long clone_flags = 0;
 
             if (nod_clone3_flags(regs, &clone_flags)) {
@@ -250,17 +281,12 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
                 break;
             }
 
-            if (clone_flags & CLONE_VM) {
-                if (!nod_proc_acquire(NOD_SHARE, NULL, -1, current))
-                    vpr_err("acquire NOD_SHARE for clone3 childed process failed\n");
-            } else {
-                /*
-                 * If the child process has its own address space, it should
-                 * inherit parent's procinfo lazily, same as clone().
-                 */
-                if (!nod_proc_acquire(NOD_CLONE, NULL, -1, current))
-                    vpr_err("acquire NOD_CLONE for clone3 childed process failed\n");
-            }
+            evt_from = (clone_flags & CLONE_VM) ? NOD_SHARE : NOD_CLONE;
+#else
+            evt_from = NOD_SHARE;
+#endif
+            if (!nod_proc_acquire(evt_from, NULL, -1, current))
+                vpr_err("acquire %d for clone3 childed process failed\n", evt_from);
 #endif
 #endif
         } else {

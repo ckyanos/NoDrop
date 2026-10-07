@@ -252,6 +252,23 @@ nod_copy_procinfo(struct task_struct *task, struct nod_proc_info *p)
     if (!task->real_parent)
         return NOD_SUCCESS;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    /*
+     * 本函数的前置条件：只有"拥有独立地址空间"的子任务才继承创建者的 monitor
+     * 实例 —— 镜像、分离栈、帧、整份 stack_info。这与约束 2（NoTamper：线程
+     * 一律 NOD_SHARE，只对齐 pkey）是同一个不变量的结构化表达，这里再兜一道：
+     * 线程组内的线程，或与创建者共用 mm 的子任务，一律不继承。
+     *
+     * 判据不能用 clone flags：分类发生在 sys_exit 探针里，clone3 的 flags 是
+     * 现读父线程用户栈上的 clone_args，父线程常常已经复用那块内存，读到 0 就
+     * 会把线程误判成 NOD_CLONE 并让它继承 leader 的镜像与帧 —— 两条线程在同一
+     * 实例上并发跑 monitor（共享 mmheap/Lua 状态）。地址空间判据不受该竞态影响。
+     */
+    if (task->tgid != task->pid ||
+        (task->mm && task->mm == task->real_parent->mm))
+        return NOD_SUCCESS;
+#endif
+
     parent = __find_proc_info(task->group_leader);
 
     if (parent) {
