@@ -53,6 +53,34 @@ calc_phdr_addr(const struct elfhdr *exec,
     return load_addr + exec->e_phoff;
 }
 
+/*
+ * b9e9e73 引入的守卫（7a1d086 删除、这里按原样恢复）：只有在线程还有 mm、且
+ * 处于可睡眠的普通进程上下文时，才允许为它映射 monitor 镜像、分配分离栈并
+ * 构造帧。6.8 的"缓冲区满"触发点在 sys_exit 探针里（抢占关闭 + RCU 读侧），
+ * 此时 current->mm 可能已经摘除、用户栈可能正在拆除，建出来的帧不可用；monitor
+ * 随后从 argv[argc-1] 读 nod_stack_info 就会读到坏指针（segfault at 18）。
+ * 不安全时只置 need_load，交给 ftrace 安全点（trace.c）完成首次加载。
+ * <6.0 没有分离栈，恒 true，行为原样。
+ */
+static bool __maybe_unused
+nod_can_create_separated_stack_now(void)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+    return true;
+#else
+    if (!current->mm)
+        return false;
+
+    if (in_interrupt() || irqs_disabled())
+        return false;
+
+    if (in_atomic() || preempt_count())
+        return false;
+
+    return true;
+#endif
+}
+
 #define MAPPING_OK          0 
 #define MAPPING_NEXT        1
 #define MAPPING_FINISH      2
@@ -163,173 +191,6 @@ create_stack_with_red_zone(unsigned long addr, unsigned long size)
                    MAP_PRIVATE | MAP_ANONYMOUS, 0);
     return addr;
 }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-static int
-count_current_envc(void)
-{
-    int envc = 0;
-    uint64_t env_start = current->mm->env_start;
-
-    while (env_start < current->mm->env_end) {
-        size_t len = strnlen_user((void __user *)env_start, MAX_ARG_STRLEN);
-
-        if (!len || len > MAX_ARG_STRLEN)
-            return -EFAULT;
-
-        env_start += len;
-        envc++;
-    }
-
-    return envc;
-}
-
-static int
-plan_separated_stack(struct nod_stack_info *stack_info,
-                     uint64_t *stack_info_addr,
-                     uint64_t *target_sp,
-                     int argc,
-                     const char *argv[])
-{
-#define STACK_ROUND_LOCAL(sp, items)  ((elf_addr_t __user *)(((uint64_t)((sp) - (items))) & ~15UL))
-#define STACK_ADD_LOCAL(sp, items)    ((elf_addr_t __user *)(sp) - (items))
-#define STACK_ALLOC_LOCAL(sp, len)    ({ (sp) -= (len); sp; })
-    const int aux_items = 11 * 2;
-    int envc, i, items;
-    uint64_t p;
-
-    p = create_stack_with_red_zone(0, CONFIG_MONITOR_STACK_SIZE);
-    if (BAD_ADDR(p))
-        return (int)p;
-
-    stack_info->stack_start = p;
-    stack_info->stack_end = p + CONFIG_MONITOR_STACK_SIZE;
-    p = stack_info->stack_end - sizeof(void *);
-
-    p = STACK_ALLOC_LOCAL(p, 16);
-    *stack_info_addr = p = STACK_ALLOC_LOCAL(p, sizeof(*stack_info));
-
-    for (i = argc - 1; i >= 0; --i)
-        p = STACK_ALLOC_LOCAL(p, strlen(argv[i]) + 1);
-
-    envc = count_current_envc();
-    if (envc < 0)
-        return envc;
-
-    items = (argc + 1) + (envc + 1) + 1 + 1;
-    *target_sp = (uint64_t)STACK_ROUND_LOCAL(STACK_ADD_LOCAL(p, aux_items), items);
-    return 0;
-}
-
-static int
-create_bootstrap_tbls(struct elfhdr *exec,
-                      uint64_t load_addr,
-                      uint64_t phdr_addr,
-                      uint64_t interp_load_addr,
-                      const struct pt_regs *regs,
-                      const struct nod_stack_info *stack_info,
-                      uint64_t *bootstrap_stack_info_addr,
-                      uint64_t *target_sp,
-                      int argc,
-                      const char *argv[])
-{
-#define STACK_ROUND_BOOT(sp, items)  ((elf_addr_t __user *)(((uint64_t)((sp) - (items))) & ~15UL))
-#define STACK_ADD_BOOT(sp, items)    ((elf_addr_t __user *)(sp) - (items))
-#define STACK_ALLOC_BOOT(sp, len)    ({ (sp) -= (len); sp; })
-    int i, envc, elf_info_idx, items;
-    uint64_t p, arg_start, original_rsp;
-    unsigned char k_rand_bytes[16];
-    elf_addr_t __user *sp;
-    elf_addr_t __user *u_rand_bytes;
-    elf_addr_t *elf_info = NULL;
-
-    p = original_rsp = regs->sp;
-
-    get_random_bytes(k_rand_bytes, sizeof(k_rand_bytes));
-    u_rand_bytes = (elf_addr_t __user *)STACK_ALLOC_BOOT(p, sizeof(k_rand_bytes));
-    if (copy_to_user(u_rand_bytes, k_rand_bytes, sizeof(k_rand_bytes)))
-        goto err;
-
-    *bootstrap_stack_info_addr = p = STACK_ALLOC_BOOT(p, sizeof(*stack_info));
-    if (copy_to_user((char __user *)p, stack_info, sizeof(*stack_info)))
-        goto err;
-
-    for (i = argc - 1; i >= 0; --i) {
-        int len = strlen(argv[i]) + 1;
-        p = STACK_ALLOC_BOOT(p, len);
-        if (copy_to_user((char __user *)p, argv[i], len))
-            goto err;
-    }
-    arg_start = p;
-
-#define INSERT_BOOT_AUX(id, val) \
-    do { \
-        elf_info[elf_info_idx++] = id; \
-        elf_info[elf_info_idx++] = val; \
-    } while (0)
-
-    elf_info_idx = 0;
-    elf_info = vmalloc(sizeof(elf_addr_t) * 11 * 2);
-    if (!elf_info)
-        goto err;
-    INSERT_BOOT_AUX(AT_HWCAP, ELF_HWCAP);
-    INSERT_BOOT_AUX(AT_PAGESZ, ELF_EXEC_PAGESIZE);
-    INSERT_BOOT_AUX(AT_CLKTCK, CLOCKS_PER_SEC);
-    INSERT_BOOT_AUX(AT_PHDR, phdr_addr);
-    INSERT_BOOT_AUX(AT_PHENT, sizeof(struct elf_phdr));
-    INSERT_BOOT_AUX(AT_PHNUM, exec->e_phnum);
-    INSERT_BOOT_AUX(AT_BASE, interp_load_addr);
-    INSERT_BOOT_AUX(AT_FLAGS, 0);
-    INSERT_BOOT_AUX(AT_ENTRY, load_addr + exec->e_entry);
-    INSERT_BOOT_AUX(AT_RANDOM, (elf_addr_t)(unsigned long)u_rand_bytes);
-    INSERT_BOOT_AUX(AT_NULL, 0);
-
-    /*
-     * This bootstrap frame only has to carry the monitor argv and the
-     * nod_stack_info pointer.  Rebuilding the traced task's original
-     * environment from mm->env_start/env_end is fragile: programs such as
-     * redis rewrite argv/environ for setproctitle(), leaving that range full
-     * of NUL bytes and making the computed frame far larger than intended.
-     */
-    envc = 0;
-
-    items = (argc + 1) + (envc + 1) + 1 + 1;
-    sp = STACK_ADD_BOOT(p, elf_info_idx);
-    sp = STACK_ROUND_BOOT(sp, items);
-    *target_sp = (unsigned long)sp;
-
-    if (__put_user(argc + 1, sp++))
-        goto err;
-
-    for (i = 0; i < argc; ++i) {
-        if (put_user((elf_addr_t)arg_start, sp++))
-            goto err;
-        arg_start += strlen(argv[i]) + 1;
-    }
-
-    if (put_user((elf_addr_t)*bootstrap_stack_info_addr, sp++))
-        goto err;
-
-    if (put_user(0, sp++))
-        goto err;
-
-    if (__put_user(0, sp++))
-        goto err;
-
-    if (copy_to_user(sp, elf_info, elf_info_idx * sizeof(elf_addr_t)))
-        goto err;
-
-    vfree(elf_info);
-    return NOD_SUCCESS;
-
-err:
-    *target_sp = original_rsp;
-    if (elf_info)
-        vfree(elf_info);
-    return -EFAULT;
-}
-#endif
-
 
 static int
 create_elf_tbls(struct elfhdr *exec,
@@ -575,8 +436,6 @@ nod_load_monitor(struct nod_proc_info *p)
     struct pt_regs *regs;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
     uint64_t phdr_addr = 0;
-    uint64_t active_sp;
-    uint64_t active_stack_info_addr;
 #else
     uint64_t entry;
     uint64_t load_addr = 0;
@@ -591,14 +450,17 @@ nod_load_monitor(struct nod_proc_info *p)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
     /*
-     * 首次加载要走 load_monitor_image -> vm_mmap（会睡眠），而本函数可能在
-     * sys_exit 探针的原子上下文（preempt disabled + RCU 读侧）里被"缓冲区满"
-     * 触发。这里只登记"待加载"，映射 + 建帧 + 改 regs 留给这条线程回到可睡眠的
+     * 首次加载（映射 monitor 镜像 + 在分离栈里建帧）要走 vm_mmap 与 vmalloc，
+     * 而本函数可能在 sys_exit 探针的原子上下文（preempt disabled + RCU 读侧）
+     * 里被"缓冲区满"触发：那时 current->mm 可能已经在拆除，建出来的帧不可用。
+     * 这里只登记"待加载"，把映射 + 建帧 + 挂 regs 留给这条线程回到可睡眠的
      * 安全点（kmodule/trace.c 里 ftrace 重定向后的 x64_sys_call 返回路径）完成。
-     * 触发条件与零丢失语义不变；<6.0 没有这个标记，行为原样。
+     * 已经建好的线程只是在原地址上刷新 stack_info 并重新挂 regs，不受此限
+     * （约束 1 的"只建一次"正是靠 p->stack_addr / stack_info.stack_start 记住
+     * 首次加载的结果）。触发条件与零丢失语义不变；<6.0 没有这个标记。
      */
-    if (!p->entry_addr || !p->stack_addr) {
-        if (in_interrupt() || irqs_disabled() || in_atomic() || preempt_count()) {
+    if (!p->entry_addr || !p->stack_addr || !p->stack_info.stack_start) {
+        if (!nod_can_create_separated_stack_now()) {
             p->need_load = 1;
             return NOD_SUCCESS;
         }
@@ -618,42 +480,59 @@ nod_load_monitor(struct nod_proc_info *p)
     }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    /*
+     * 约束 1（NoTamper「build once, then only refresh in place」）：
+     * 首次加载时把帧建在刚分配出来的分离栈顶部，create_elf_tbls() 直接把
+     * stack_info 副本与 argv/env/auxv 写进那块栈，并回填真实的 stack_addr
+     * （帧顶）与 stack_info_addr（帧内 stack_info 副本的地址）。此后每次注入
+     * 都只把刷新过的 stack_info 写回那个**不变**的地址，再把 regs 指向同一份
+     * 帧与同一个入口 —— 不重新规划栈、不重新切栈、不建引导帧。
+     */
     if (!p->entry_addr) {
-        retval = load_monitor_image(&p->entry_addr, &p->load_addr,
-                                    &phdr_addr, &p->interp_load_addr);
-        if (retval != NOD_SUCCESS)
-            goto out;
-    }
+        int attempt;
 
-    phdr_addr = calc_phdr_addr(&monitor_elf_ex, monitor_elf_phdata, p->load_addr);
-    p->stack_info.syscall_nr = syscall_get_nr(current, regs);
-    syscall_get_arguments_deprecated(current, regs, 0, 1, &p->stack_info.exit_code);
-
-    if (!p->stack_addr || !p->stack_info_addr || !p->stack_info.fsbase) {
-        if (!(p->stack_info.stack_start && p->stack_info.stack_end)) {
-            retval = plan_separated_stack(&p->stack_info, &p->stack_info_addr,
-                                          &p->stack_addr, argc, argv);
-            if (retval != NOD_SUCCESS)
+        /*
+         * 镜像的后续 PT_LOAD 段用 MAP_FIXED_NOREPLACE 铺（见 elf.c）：如果
+         * 首段占位后、后续段铺设前，同进程别的线程正好把镜像区间里的空洞抢走
+         * （分离栈就是 1MiB 的 mmap/munmap/mmap 三步），本次加载会干净地拿到
+         * -EEXIST，而不是用 MAP_FIXED 把别人的映射换成只读镜像页。这时换一块
+         * 空闲区间重试即可：不覆盖任何已有映射，也不丢这次注入（最多 3 次）。
+         */
+        for (attempt = 0; ; attempt++) {
+            retval = load_monitor_image(&p->entry_addr, &p->load_addr,
+                                        &phdr_addr, &p->interp_load_addr);
+            if (retval == NOD_SUCCESS)
+                break;
+            if (retval != -EEXIST || attempt >= 2)
                 goto out;
         }
-        p->stack_info.stack_addr = p->stack_addr;
-        p->stack_info.stack_info_addr = p->stack_info_addr;
+    }
 
-        retval = create_bootstrap_tbls(&monitor_elf_ex, p->load_addr, phdr_addr,
-                                       p->interp_load_addr, regs, &p->stack_info,
-                                       &active_stack_info_addr, &active_sp,
-                                       argc, argv);
+    if (!p->stack_addr || !p->stack_info.stack_start) {
+        uint64_t target_sp, target_stack_info_addr;
+
+        retval = create_elf_tbls(&monitor_elf_ex, p->load_addr,
+                                 p->interp_load_addr, &p->stack_info,
+                                 &target_stack_info_addr, &target_sp,
+                                 argc, argv);
         if (retval != NOD_SUCCESS)
             goto out;
-    } else {
-        active_sp = p->stack_addr;
-        active_stack_info_addr = p->stack_info_addr;
-        p->stack_info.stack_addr = p->stack_addr;
-        p->stack_info.stack_info_addr = p->stack_info_addr;
-        retval = update_stack_info(&p->stack_info, active_stack_info_addr);
-        if (retval != 0)
-            goto out;
+
+        p->stack_addr = target_sp;
+        p->stack_info_addr = target_stack_info_addr;
+        p->stack_info.stack_addr = target_sp;
+        p->stack_info.stack_info_addr = target_stack_info_addr;
+
+        vpr_dbg("monitor: entry 0x%llx stack [0x%llx-0x%llx] stack_info_addr 0x%llx\n",
+                p->entry_addr, p->stack_info.stack_start,
+                p->stack_info.stack_end, p->stack_info_addr);
     }
+
+    p->stack_info.syscall_nr = syscall_get_nr(current, regs);
+    syscall_get_arguments_deprecated(current, regs, 0, 1, &p->stack_info.exit_code);
+    retval = update_stack_info(&p->stack_info, p->stack_info_addr);
+    if (retval != 0)
+        goto out;
 #else
     if (!p->entry_addr) {
         retval = load_monitor_image(&entry, &load_addr,
@@ -687,11 +566,8 @@ nod_load_monitor(struct nod_proc_info *p)
     nod_prepare_context(p, regs);
 
     elf_reg_init(&current->thread, regs, 0);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-    regs->sp = active_sp;
-#else
+    /* 每次都挂回同一份帧、同一个入口（约束 1：地址只在上面的首次加载里定一次） */
     regs->sp = p->stack_addr;
-#endif
     regs->cx = regs->ip = p->entry_addr;
 
     return NOD_SUCCESS_LOAD;
