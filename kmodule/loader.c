@@ -421,12 +421,6 @@ nod_load_monitor(struct nod_proc_info *p)
     regs = current_pt_regs();
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-    /*
-     * 首次加载与否已经由触发点按“路径”决定：sys_exit 探针（原子上下文）里的
-     * 缓冲区满只登记 p->need_load（见 events.c 的触发点），映射 + 建帧 + 挂 regs
-     * 一律在 ftrace 重定向后的 x64_sys_call 返回路径（trace.c: nod_run_deferred_load）
-     * 完成；能走到这里说明上下文是安全的，直接加载。不再需要运行时上下文探测。
-     */
     p->need_load = 0;
 #endif
 
@@ -442,24 +436,9 @@ nod_load_monitor(struct nod_proc_info *p)
     }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-    /*
-     * 约束 1（NoTamper「build once, then only refresh in place」）：
-     * 首次加载时把帧建在刚分配出来的分离栈顶部，create_elf_tbls() 直接把
-     * stack_info 副本与 argv/env/auxv 写进那块栈，并回填真实的 stack_addr
-     * （帧顶）与 stack_info_addr（帧内 stack_info 副本的地址）。此后每次注入
-     * 都只把刷新过的 stack_info 写回那个**不变**的地址，再把 regs 指向同一份
-     * 帧与同一个入口 —— 不重新规划栈、不重新切栈、不建引导帧。
-     */
     if (!p->entry_addr) {
         int attempt;
 
-        /*
-         * 镜像的后续 PT_LOAD 段用 MAP_FIXED_NOREPLACE 铺（见 elf.c）：如果
-         * 首段占位后、后续段铺设前，同进程别的线程正好把镜像区间里的空洞抢走
-         * （分离栈就是 1MiB 的 mmap/munmap/mmap 三步），本次加载会干净地拿到
-         * -EEXIST，而不是用 MAP_FIXED 把别人的映射换成只读镜像页。这时换一块
-         * 空闲区间重试即可：不覆盖任何已有映射，也不丢这次注入（最多 3 次）。
-         */
         for (attempt = 0; ; attempt++) {
             retval = load_monitor_image(&p->entry_addr, &p->load_addr,
                                         &phdr_addr, &p->interp_load_addr);
@@ -528,7 +507,6 @@ nod_load_monitor(struct nod_proc_info *p)
     nod_prepare_context(p, regs);
 
     elf_reg_init(&current->thread, regs, 0);
-    /* 每次都挂回同一份帧、同一个入口（约束 1：地址只在上面的首次加载里定一次） */
     regs->sp = p->stack_addr;
     regs->cx = regs->ip = p->entry_addr;
 

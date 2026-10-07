@@ -98,19 +98,11 @@ int evt_arg_to_string(const struct nod_param_info *param, const void *data, uint
     }
 }
 
-/*
- * 剩余可写长度：off 一旦越过 mx_size，mx_size - off 就是负数，
- * 传给 snprintf 会被转成巨大的 size_t 从而越界写（历史崩溃点），这里夹到 0。
- */
 static int nod_left(int mx_size, int off)
 {
     return off < mx_size ? mx_size - off : 0;
 }
 
-/*
- * 带边界的追加：只在还有空间时格式化，并把 snprintf "本来要写"的返回值
- * 钳进 [0, mx_size]，保证 out 始终以 '\0' 结尾且 off 不会失控。
- */
 static void nod_append(char *out, int mx_size, int *off, const char *fmt, ...)
 {
     va_list ap;
@@ -130,7 +122,6 @@ static void nod_append(char *out, int mx_size, int *off, const char *fmt, ...)
         *off = mx_size;
 }
 
-/* 定长参数在事件里至少占这么多字节；0 表示长度由长度表给出（字符串类） */
 static size_t nod_param_min_size(int type)
 {
     switch (type)
@@ -183,7 +174,6 @@ int get_whole_event(const struct nod_event_hdr *hdr, char *out, int mx_size) {
 
     info = &g_event_info[hdr->type];
 
-    /* 长度表（每个参数一个 uint16_t 长度）必须落在事件声明长度之内 */
     args = (const uint16_t *)(hdr + 1);
     data = (const char *)(args + info->nparams);
     ev_end = (const char *)hdr + hdr->len;
@@ -215,10 +205,6 @@ int get_whole_event(const struct nod_event_hdr *hdr, char *out, int mx_size) {
         /* param name */
         nod_append(out, mx_size, &off, "%s=", param->name);
 
-        /*
-         * param value：只按事件声明长度内的字节读，长度表撒谎时打 <oob> 并停止，
-         * 不再像以前那样把 data / 长度推进到事件之外。
-         */
         alen = args[i];
         if ((size_t)alen > avail)
             alen = (uint16_t)avail;
@@ -234,7 +220,6 @@ int get_whole_event(const struct nod_event_hdr *hdr, char *out, int mx_size) {
         data += alen;
     }
 
-    /* closing：同样在边界检查之内，写不下就只保留已写好的部分 */
     nod_append(out, mx_size, &off, ")\n");
     return off;
 }

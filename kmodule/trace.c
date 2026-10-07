@@ -48,10 +48,6 @@ static uint64_t nod_lookup_name(const char *name);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 #ifdef __NR_clone3
-/*
- * 约束 2（NoTamper）后不再参与分类决定：子任务一律 NOD_SHARE，不再按 clone
- * flags 区分。保留这个读取函数以便 #if 0 里的原分类代码仍然完整可还原。
- */
 static int __maybe_unused nod_clone3_flags(struct pt_regs *regs, unsigned long *flags)
 {
     unsigned long uargs;
@@ -231,19 +227,6 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
         if (id == __NR_clone && ret == 0) {
             // child task
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-            /*
-             * 约束 2（NoTamper「threads always share」）：clone/clone3 的子任务
-             * 一律按 NOD_SHARE 处理，不看 clone flags。共享路径只把 pkey 对齐到
-             * group leader，镜像 / 分离栈 / 帧都不继承 —— 每个子任务在自己的
-             * 首次激活时各自映射一份 monitor 镜像、各自分配分离栈、各自建帧。
-             *
-             * 原按 flags 分类的代码保留在 #if 0 里（NoTamper 的形态）：6.8 上这
-             * 段分类发生在 sys_exit 探针里，clone3 要现读父线程用户栈上的
-             * struct clone_args，父线程常常已经复用那块内存（200 次 pthread
-             * 创建里 5~9 次读到 flags=0），于是线程被判成 NOD_CLONE 并继承
-             * leader 的镜像与帧，两条线程在同一个实例上并发跑 monitor。
-             * <6.0 的 clone 分类读的是寄存器（准确），保持逐字节不变。
-             */
 #if 0
             unsigned long clone_flags;
             syscall_get_arguments_deprecated(current, regs, 1, 1, &clone_flags);
@@ -536,20 +519,6 @@ nod_skip_current_task(void)
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-/*
- * 触发点在 sys_exit 探针（原子上下文）时，首次注入只置 p->need_load；
- * 这里（ftrace 重定向后的 x64_sys_call 返回路径、普通进程上下文）把注入做完。
- * nod_load_monitor() 内部用 current_pt_regs() 改 regs，因此进入 monitor 的
- * 时机就是这次系统调用返回用户态之前，语义与"触发点同步加载"一致。
- *
- * retval 是本次系统调用将要返回给应用的值：本函数就是 x64_sys_call 的替身，
- * do_syscall_x64 要等我们返回之后才执行 regs->ax = 返回值；而注入会把
- * current_pt_regs() 整份存进 p->ctx，monitor 结束时模块再把它 memcpy 回 regs
- * （monitor 走 ioctl RESTORE_CONTEXT）。所以注入之前必须先把真实返回值写进
- * regs->ax，否则存下来的是 entry_SYSCALL_64 压入的 -ENOSYS 占位值，应用会在
- * monitor 返回后拿到 -ENOSYS（动态链接器的 mprotect 于是报
- * "cannot apply additional memory protection after relocation: Error 38"）。
- */
 static void
 nod_run_deferred_load(long retval)
 {
@@ -590,12 +559,6 @@ nod_x64_sys_call_hook(const struct pt_regs *regs, unsigned int nr)
             ret = nod_old_x64_sys_call(regs, nr);
     }
 
-    /*
-     * 安全点：ftrace 把 x64_sys_call 的返回路径重定向到这里，此时真实系统调用
-     * 已经跑完、上下文可睡眠（不是探针/ftrace 回调里）。原子触发点（缓冲区满）
-     * 推迟下来的首次注入在这里完成：映射 + 建帧 + 改 regs 都在安全上下文里做。
-     * 触发条件、零丢失、每线程实例都不变；<6.0 没有这个标记，函数体为空。
-     */
     nod_run_deferred_load(ret);
 
     return ret;

@@ -367,19 +367,6 @@ elf_load_binary(struct elfhdr *elf_ex,
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,0,0)
             if (!first_pt_load) {
-                /*
-                 * 后续 PT_LOAD 段不能用 MAP_FIXED 静默替换：monitor 是注入到
-                 * 已经有映射的多线程 mm 里，首段按 total_size 占位后
-                 * elf_map() 会把多余部分 vm_munmap 掉（官方 execve 的单线程前提
-                 * 在这里不成立），镜像地址区间里因此留了一个空洞；同进程其它
-                 * 线程的 mmap（分离栈就是 1MiB 的 mmap/munmap/mmap 三步）可能正好
-                 * 落进去，随后这里的 MAP_FIXED 会把它悄悄覆盖成只读镜像页 ——
-                 * 分离栈里的帧被顶掉，monitor 读 argv[argc-1] 得到 NULL 即
-                 * segfault at 18，或写自己的栈时保护错误（error 7）。
-                 * 改成 NOREPLACE：地址空闲时行为完全不变；被占用时返回 -EEXIST，
-                 * 由调用方（loader.c 首次加载）换一块空闲区间重试，而不是破坏
-                 * 别人的映射。
-                 */
 #if defined(MAP_FIXED_NOREPLACE)
                 elf_type |= MAP_FIXED_NOREPLACE;
 #else
