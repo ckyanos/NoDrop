@@ -143,7 +143,19 @@ restart:
     }
 
     if (force) {
-        cbret = nod_load_monitor(p);
+        /*
+         * 触发来自 sys_exit 探针（event_datap->force == 0，原子上下文）且该任务
+         * 还没加载过时：只登记 need_load，由 ftrace 重定向后的 x64_sys_call 返回
+         * 路径（trace.c: nod_run_deferred_load）完成首次加载 —— 映射/建帧不在
+         * 探针里做。来自 exit_filter（force == 1，ftrace 安全上下文）或已经加载
+         * 过的任务，照旧原地刷新 stack_info 并重挂 regs。
+         */
+        if (event_datap->force == 0 &&
+            (!p->entry_addr || !p->stack_addr || !p->stack_info.stack_start)) {
+            p->need_load = 1;
+        } else {
+            cbret = nod_load_monitor(p);
+        }
     }
 
     return cbret; 

@@ -53,34 +53,6 @@ calc_phdr_addr(const struct elfhdr *exec,
     return load_addr + exec->e_phoff;
 }
 
-/*
- * b9e9e73 引入的守卫（7a1d086 删除、这里按原样恢复）：只有在线程还有 mm、且
- * 处于可睡眠的普通进程上下文时，才允许为它映射 monitor 镜像、分配分离栈并
- * 构造帧。6.8 的"缓冲区满"触发点在 sys_exit 探针里（抢占关闭 + RCU 读侧），
- * 此时 current->mm 可能已经摘除、用户栈可能正在拆除，建出来的帧不可用；monitor
- * 随后从 argv[argc-1] 读 nod_stack_info 就会读到坏指针（segfault at 18）。
- * 不安全时只置 need_load，交给 ftrace 安全点（trace.c）完成首次加载。
- * <6.0 没有分离栈，恒 true，行为原样。
- */
-static bool __maybe_unused
-nod_can_create_separated_stack_now(void)
-{
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
-    return true;
-#else
-    if (!current->mm)
-        return false;
-
-    if (in_interrupt() || irqs_disabled())
-        return false;
-
-    if (in_atomic() || preempt_count())
-        return false;
-
-    return true;
-#endif
-}
-
 #define MAPPING_OK          0 
 #define MAPPING_NEXT        1
 #define MAPPING_FINISH      2
@@ -450,21 +422,11 @@ nod_load_monitor(struct nod_proc_info *p)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
     /*
-     * 首次加载（映射 monitor 镜像 + 在分离栈里建帧）要走 vm_mmap 与 vmalloc，
-     * 而本函数可能在 sys_exit 探针的原子上下文（preempt disabled + RCU 读侧）
-     * 里被"缓冲区满"触发：那时 current->mm 可能已经在拆除，建出来的帧不可用。
-     * 这里只登记"待加载"，把映射 + 建帧 + 挂 regs 留给这条线程回到可睡眠的
-     * 安全点（kmodule/trace.c 里 ftrace 重定向后的 x64_sys_call 返回路径）完成。
-     * 已经建好的线程只是在原地址上刷新 stack_info 并重新挂 regs，不受此限
-     * （约束 1 的"只建一次"正是靠 p->stack_addr / stack_info.stack_start 记住
-     * 首次加载的结果）。触发条件与零丢失语义不变；<6.0 没有这个标记。
+     * 首次加载与否已经由触发点按“路径”决定：sys_exit 探针（原子上下文）里的
+     * 缓冲区满只登记 p->need_load（见 events.c 的触发点），映射 + 建帧 + 挂 regs
+     * 一律在 ftrace 重定向后的 x64_sys_call 返回路径（trace.c: nod_run_deferred_load）
+     * 完成；能走到这里说明上下文是安全的，直接加载。不再需要运行时上下文探测。
      */
-    if (!p->entry_addr || !p->stack_addr || !p->stack_info.stack_start) {
-        if (!nod_can_create_separated_stack_now()) {
-            p->need_load = 1;
-            return NOD_SUCCESS;
-        }
-    }
     p->need_load = 0;
 #endif
 
